@@ -1,121 +1,92 @@
 ﻿
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
-
 #include <stdio.h>
+#include <iostream>
+#include <memory>
+#include <string>
 
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size);
 
-__global__ void addKernel(int *c, const int *a, const int *b)
-{
-    int i = threadIdx.x;
-    c[i] = a[i] + b[i];
+/*
+	Tutaj mamy testową klasę, której zadaniem jest trzymanie listy Int ów
+
+*/
+class Entity {
+public:
+	int* data;
+	Entity(int size) : data(new int[size]) {}
+	~Entity() { delete[] data; }
+};
+
+
+
+/*
+	Funkcja globalna przechodzimy przez każdy element listy z klasy entity i mnożymy go przez 2
+    Jest to funkcja CUDA która wykonuje tą operacje na GPU
+
+*/
+__global__ void kernel(int* deviceData, int size) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < size) {
+        deviceData[idx] *= 2;
+        printf("Thread %d: data[%d] = %d\n", idx, idx, deviceData[idx]); /* Tutaj też print żeby było widać bez debuggera co i jak */
+    }
 }
 
-int main()
-{
-    const int arraySize = 5;
-    const int a[arraySize] = { 1, 2, 3, 4, 5 };
-    const int b[arraySize] = { 10, 20, 30, 40, 50 };
-    int c[arraySize] = { 0 };
+/* Tutaj mamy dwie podstawowe funkcje to przekazywania danych, od hosta(CPU) do GPU i w drugą stronę*/
+void copyToGPU(int* device_ptr, int* host_ptr, int size) {
+    cudaMemcpy(device_ptr, host_ptr, size * sizeof(int), cudaMemcpyHostToDevice);
+}
 
-    // Add vectors in parallel.
-    cudaError_t cudaStatus = addWithCuda(c, a, b, arraySize);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addWithCuda failed!");
-        return 1;
+/* Tutaj trzeba pamiętać aby przekazać sahred_ptr bo jeśli zmodyfikujemy dane przekazane z Entity to faktycznie Kernel wykona obliczenia, ale te dane są alokowane w innym miejscu w pamięci i faktycznie nie modyfikują
+danych w sharedEntity
+*/
+void copyFromGPUToHost(int* device_ptr, std::shared_ptr<Entity> sharedEntity, int size) {
+    cudaMemcpy(sharedEntity->data, device_ptr, size * sizeof(int), cudaMemcpyDeviceToHost);
+}
+
+int main() {
+    int size = 1024;
+
+    {
+        std::shared_ptr<Entity> e0;
+        {
+            std::shared_ptr<Entity> sharedEntity = std::make_shared<Entity>(size);
+            e0 = sharedEntity;
+
+            
+            for (int i = 0; i < size; i++) {
+                sharedEntity->data[i] = i;
+            }
+
+            int* deviceData;
+            cudaMalloc(&deviceData, size * sizeof(int));
+
+            copyToGPU(deviceData, sharedEntity->data, size); 
+            /* 
+            this	0x000000a8f178f628 shared_ptr {data=0x000001dbec1e9af0 {0} } [2 strong refs] [make_shared]	const std::shared_ptr<Entity> *
+            */
+
+            
+            /* Tutaj wiem, że podkresla tą jedną strzałkę, ale nie wiem czym to jest spowodowane, nie wygląda jakby powodowało jakieś błędy*/
+            int threadsPerBlock = 256; 
+            int blocksPerGrid = (size + threadsPerBlock - 1) / threadsPerBlock; /* Tutaj mi chat podpowiedział jak to wykalkulować jak coś*/
+
+            kernel <<<blocksPerGrid, threadsPerBlock >> > (deviceData, size); /* Nie przejmuj się tym podkreśleniem, jest to chyba wina interpretera, bo w rzeczywistośc
+            nie jest to błąd */
+            cudaDeviceSynchronize();
+            copyFromGPUToHost(deviceData, sharedEntity, size);
+
+            cudaFree(deviceData); /* Zwalniamy całą używaną pamięć zarezerwowaną dla naszego deviceData */
+
+            /* Tutaj dodałem pętle for by printować te dane, jeśli nie chcesz zaglądać w debuggera */
+            std::cout << "Modified Data:" << std::endl;
+            for (int i = 0; i < size; i++) {
+                std::cout << sharedEntity->data[i] << " ";
+            }
+        }
     }
 
-    printf("{1,2,3,4,5} + {10,20,30,40,50} = {%d,%d,%d,%d,%d}\n",
-        c[0], c[1], c[2], c[3], c[4]);
-
-    // cudaDeviceReset must be called before exiting in order for profiling and
-    // tracing tools such as Nsight and Visual Profiler to show complete traces.
-    cudaStatus = cudaDeviceReset();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceReset failed!");
-        return 1;
-    }
-
+    std::cin.get();
     return 0;
-}
-
-// Helper function for using CUDA to add vectors in parallel.
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
-{
-    int *dev_a = 0;
-    int *dev_b = 0;
-    int *dev_c = 0;
-    cudaError_t cudaStatus;
-
-    // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(0);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-        goto Error;
-    }
-
-    // Allocate GPU buffers for three vectors (two input, one output)    .
-    cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    // Launch a kernel on the GPU with one thread for each element.
-    addKernel<<<1, size>>>(dev_c, dev_a, dev_b);
-
-    // Check for any errors launching the kernel
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
-    
-    // cudaDeviceSynchronize waits for the kernel to finish, and returns
-    // any errors encountered during the launch.
-    cudaStatus = cudaDeviceSynchronize();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-        goto Error;
-    }
-
-    // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-Error:
-    cudaFree(dev_c);
-    cudaFree(dev_a);
-    cudaFree(dev_b);
-    
-    return cudaStatus;
 }
